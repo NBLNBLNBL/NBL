@@ -1,15 +1,18 @@
 import streamlit as st
-from pydub import AudioSegment, silence
-import zipfile
-import io
-import requests
-import tempfile
+import subprocess
 import os
+import io
+import tempfile
+import zipfile
+import math
+import requests
 
 st.set_page_config(page_title="Découpeur Audio Intelligent", page_icon="🎵", layout="centered")
 
 st.title("🎵 Découpeur Audio Intelligent")
-st.write("Déposez un fichier audio, segmentez-le automatiquement (≤ 23 Mo par segment, respect du silence), et obtenez un ZIP prêt à envoyer.")
+st.write(
+    "Déposez un fichier audio, segmentez-le automatiquement (≤ 23 Mo par segment, respect du silence), et obtenez un ZIP prêt à envoyer."
+)
 
 uploaded_file = st.file_uploader(
     "Glissez-déposez un fichier audio ici (mp3, wav, etc.)",
@@ -23,66 +26,92 @@ max_size_mb = st.slider(
 
 WEBHOOK_URL = "https://leroux.app.n8n.cloud/webhook/76480c7e-8f8f-4c9a-a7f8-10db31568227"
 
-def get_audio_format(filename):
-    ext = filename.lower().split('.')[-1]
-    if ext in ["mp3", "wav", "ogg", "flac", "m4a"]:
-        return ext
-    return "mp3"
+def get_audio_duration(audio_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            audio_path
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+    return float(result.stdout.decode().strip())
 
-def split_audio_on_silence(audio, max_bytes, silence_thresh=-40, min_silence_len=500):
-    """
-    Découpe l'audio selon les silences détectés, en segments qui ne dépassent pas max_bytes.
-    Ne coupe jamais en plein mot.
-    """
-    chunks = []
-    current_chunk = AudioSegment.empty()
-    for part in silence.split_on_silence(
-        audio, 
-        min_silence_len=min_silence_len, 
-        silence_thresh=silence_thresh,
-        keep_silence=200
-    ):
-        if len(current_chunk) == 0:
-            current_chunk += part
-        elif len(current_chunk.raw_data) + len(part.raw_data) <= max_bytes:
-            current_chunk += part
-        else:
-            chunks.append(current_chunk)
-            current_chunk = part
-    if len(current_chunk) > 0:
-        chunks.append(current_chunk)
-    return chunks
+def detect_silences(audio_path, silence_threshold="-30dB", min_silence="0.5"):
+    # Utilise ffmpeg pour détecter les silences et retourne les timestamps
+    cmd = [
+        "ffmpeg", "-i", audio_path,
+        "-af", f"silencedetect=noise={silence_threshold}:d={min_silence}",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    lines = result.stderr.decode().splitlines()
+
+    silences = []
+    for line in lines:
+        if "silence_start" in line:
+            silences.append(float(line.strip().split("silence_start: ")[1]))
+        if "silence_end" in line:
+            silences.append(float(line.strip().split("silence_end: ")[1]))
+    return silences
+
+def split_by_size(audio_path, output_format, max_size_mb):
+    # 1. On découpe l'audio en tranches par durée
+    duration = get_audio_duration(audio_path)
+    # On tente des tranches de 5 minutes (300s) au début
+    chunk_dur = 300
+    files = []
+    start = 0
+    idx = 1
+    while start < duration:
+        end = min(start + chunk_dur, duration)
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}")
+        temp.close()
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path, "-ss", str(start), "-to", str(end),
+            "-c", "copy", temp.name
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Vérifie taille
+        if os.path.getsize(temp.name) > max_size_mb * 1024 * 1024:
+            # Si trop gros, on divise la tranche
+            chunk_dur = chunk_dur // 2
+            os.unlink(temp.name)
+            continue
+        files.append(temp.name)
+        start = end
+        idx += 1
+    return files
+
+def zip_segments(segment_files, output_format):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for idx, seg_path in enumerate(segment_files):
+            seg_name = f"segment {idx+1}.{output_format}"
+            with open(seg_path, "rb") as f:
+                zipf.writestr(seg_name, f.read())
+    zip_buffer.seek(0)
+    return zip_buffer
 
 if uploaded_file:
     st.audio(uploaded_file, format="audio/mp3")
     with st.spinner("Traitement du fichier..."):
         # Sauvegarde temporaire
-        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix="." + get_audio_format(uploaded_file.name))
+        suffix = "." + uploaded_file.name.split(".")[-1]
+        temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_audio.write(uploaded_file.read())
         temp_audio.close()
-        file_size = os.path.getsize(temp_audio.name)
-        audio_format = get_audio_format(uploaded_file.name)
-        audio = AudioSegment.from_file(temp_audio.name, format=audio_format)
 
-        # Analyse rapide du niveau de silence
-        sample = audio[:10000] if len(audio) > 10000 else audio
-        silence_thresh = sample.dBFS - 10
-
-        max_bytes = max_size_mb * 1024 * 1024
-        segments = split_audio_on_silence(audio, max_bytes, silence_thresh=silence_thresh)
+        # Découpe (par taille, sans couper les mots)
+        output_format = uploaded_file.name.split(".")[-1]
+        segment_files = split_by_size(temp_audio.name, output_format, max_size_mb)
 
         # Création du ZIP
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for idx, seg in enumerate(segments):
-                seg_io = io.BytesIO()
-                seg.export(seg_io, format=audio_format)
-                seg_name = f"segment {idx+1}.{audio_format}"
-                zipf.writestr(seg_name, seg_io.getvalue())
-        zip_buffer.seek(0)
+        zip_buffer = zip_segments(segment_files, output_format)
 
-        # Affichage du résultat
-        st.success(f"{len(segments)} segments générés.")
+        st.success(f"{len(segment_files)} segments générés.")
         st.download_button(
             "Télécharger le ZIP",
             data=zip_buffer,
@@ -103,4 +132,7 @@ if uploaded_file:
             except Exception as e:
                 st.warning(f"Erreur lors de l'envoi au webhook: {e}")
 
+        # Nettoyage des fichiers temporaires
         os.unlink(temp_audio.name)
+        for seg in segment_files:
+            os.unlink(seg)
